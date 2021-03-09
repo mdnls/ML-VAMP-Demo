@@ -1,6 +1,7 @@
 import torch
 import numpy as np
-
+import scipy.sparse
+import scipy.sparse.linalg
 
 '''
 Top level class: ML_VAMP_Solver
@@ -89,7 +90,48 @@ class LayerEstimator():
             raise ValueError(f"dir '{dir}' not recognized. Must be one of 'fwd' or 'bck'.")
 
     def _g(self, in_res, out_res, theta, dir, with_onsager=False, mode="map"):
+        '''
+        Using input and output residuals, compute a denoised estimate of this layer's activation.
+        Return the denoised estimate.
+
+        Args:
+            in_res (torch.Tensor or None): the input residual.
+            out_res (torch.Tensor or None): the output residual.
+            theta (torch.Tensor): noise estimate.
+            dir (string): either "fwd" or "bck"
+            with_onsager: if True, returns a tuple (z, a) where z is the denoised estimate and a is the
+                corresponding Onsager term.
+            mode: either "map" for maximum a posteriori estimation or "mmse" for minimum mean squared error
+                estimation.
+
+        Returns (torch.Tensor or (torch.Tensor, torch.Tensor)): either z or (z, a) where z is the
+            denoised estimate and a is the corresponding Onsager term.
+        '''
         raise NotImplementedError("Subclasses implement this method.")
+
+    def _val_g_inputs(self, out_res, in_res, theta, dir, mode):
+        assert mode in ["map", "mmse"], f"Mode {mode} not recognized. Choose 'map' or 'mmse'."
+        assert dir in ["fwd", "back"], f"Direction {dir} not recognize. Choose 'fwd' or 'bck'."
+
+        def given(x):
+            return (x is not None)
+
+        if(not (given(in_res) or given(theta[1])) and given(out_res) and given(theta[0])):
+            assert dir == "fwd", "Cannot run backward iteration at first layer."
+            in_res = torch.zeros_like(out_res)
+            theta[1] = self.latent_prec
+            if(not (given(in_res) or given(theta[1])) ):
+                raise ValueError("Attempt to use input layer without passing input prior information.")
+        elif(not (given(out_res) or given(theta[0])) and given(in_res) and given(theta[1])):
+            assert dir == "bck", "Cannot run forward iteration at last layer."
+            out_res = self.measurements
+            theta[0] = self.measurements_prec
+            if(not (given(out_res) or given(theta[0])) ):
+                raise ValueError("Attempt to use output layer without passing output prior information.")
+        else:
+            raise ValueError("Invalid combination of residual, theta inputs to ReLU proximal denoiser.")
+
+        return out_res, in_res, theta
 
     def __delitem__(self, key):
         self.params.__delattr__(key)
@@ -130,47 +172,8 @@ class EmptyNeighbor():
 
 class ReLULayerEstimator(LayerEstimator):
     def _g(self, out_res, in_res, theta, dir, with_onsager=False, mode="map"):
-        '''
-        Using input and output residuals, compute a denoised estimate of this layers activation.
-        Return the denoised estimate.
 
-        Args:
-            out_res (torch.Tensor or None): the output residual.
-            in_res (torch.Tensor or None): the input residual.
-            theta (torch.Tensor): noise estimate.
-            dir (string): either "fwd" or "bck"
-            with_onsager: if True, returns a tuple (z, a) where z is the denoised estimate and a is the
-                corresponding Onsager term.
-            mode: either "map" for maximum a posteriori estimation or "mmse" for minimum mean squared error
-                estimation.
-
-        Returns (torch.Tensor or (torch.Tensor, torch.Tensor)): either z or (z, a) where z is the
-            denoised estimate and a is the corresponding Onsager term.
-        '''
-
-        # cases:
-        # - in res, theta[1] is None
-        # - out res, theta[0] is None
-        # - neither are none
-        assert mode in ["map", "mmse"], f"Mode {mode} not recognized. Choose 'map' or 'mmse'."
-        assert dir in ["fwd", "back"], f"Direction {dir} not recognize. Choose 'fwd' or 'bck'."
-        def given(x):
-            return (x is not None)
-
-        if(not (given(in_res) or given(theta[1])) and given(out_res) and given(theta[0])):
-            assert dir == "fwd", "Cannot run backward iteration at first layer."
-            in_res = torch.zeros_like(out_res)
-            theta[1] = self.latent_prec
-            if(not (given(in_res) or given(theta[1])) ):
-                raise ValueError("Attempt to use input layer without passing input prior information.")
-        elif(not (given(out_res) or given(theta[0])) and given(in_res) and given(theta[1])):
-            assert dir == "bck", "Cannot run forward iteration at last layer."
-            out_res = self.measurements
-            theta[0] = self.measurements_prec
-            if(not (given(out_res) or given(theta[0])) ):
-                raise ValueError("Attempt to use output layer without passing output prior information.")
-        else:
-            raise ValueError("Invalid combination of residual, theta inputs to ReLU proximal denoiser.")
+        out_res, in_res, theta = self._val_g_inputs(out_res, in_res, theta, dir, mode)
 
         if (mode == "map"):
             gm_out, gm_in = theta
@@ -201,4 +204,182 @@ class ReLULayerEstimator(LayerEstimator):
                     return z_est_in
         elif(mode == "mmse"):
             raise NotImplementedError("mmse is not implemented for ReLU.")
+
+class LinearLayerEstimator(LayerEstimator):
+    def __init__(self, mode, layer, measurements=None, measurement_prec=None, latent_prec=None):
+        super().__init__(mode, layer, measurements, measurement_prec, latent_prec)
+        self.A = layer.weight.detach().cpu().numpy()
+        self.b = layer.bias.detach().cpu().numpy()
+        self.AtA = self.A.T @ self.A
+
+    def _g(self, out_res, in_res, theta, dir, with_onsager=False, mode="map"):
+        out_res, in_res, theta = self._val_g_inputs(out_res, in_res, theta, dir, mode)
+
+        in_dim = len(in_res)
+
+        # note that map and mmse formulations are equivalent, so mode doesn't matter.
+        gm_out, gm_in = theta
+
+        '''
+        # the MAP estimate of z_in is M^{-1} d where M is like vI + W^T W, d is like a residual
+        M = gm_in * torch.eye(in_dim) + self.AtA
+        d = gm_in * in_res + gm_out * self.A.T @ (out_res - self.b)
+
+        z_est_in = torch.linalg.solve(d, M)
+        z_est_out = self.layer.forward(z_est_in)
+        '''
+
+        F = LinearLSQROp(self.A, self.b, in_res, out_res, gm_in, gm_out)
+        r = F.target_vec()
+        z = scipy.sparse.linalg.lsqr(F, r)[0]
+        z_est_in, z_est_out = F.split(z)
+
+        if (with_onsager):
+            if (dir == "fwd"):
+                # onsager is average of grad wrt out residual
+                # todo: does this expression agree with the divergence of M^{-1} b as a function of out_res?
+                #       (this expr is derived via differentiating cost at an optimizer)
+                onsager = torch.mean(gm_out * (out_res - z_est_out))
+                return z_est_out, onsager
+            elif (dir == "bck"):
+                onsager = torch.mean(gm_in * (in_res - z_est_in))
+                return z_est_in, onsager
+        else:
+            if (dir == "fwd"):
+                return z_est_out
+            elif (dir == "bck"):
+                return z_est_in
+
+class ConvLayerEstimator(LayerEstimator):
+    def __init__(self, mode, conv, measurements=None, measurement_prec=None, latent_prec=None, transpose=False):
+        super().__init__(mode, conv, measurements, measurement_prec, latent_prec)
+        self.transpose = transpose
+
+    def _g(self, out_res, in_res, theta, dir, with_onsager=False, mode="map"):
+        out_res, in_res, theta = self._val_g_inputs(out_res, in_res, theta, dir, mode)
+        gm_out, gm_in = theta
+
+        F = ConvLSQROp(self.conv, out_res, in_res, gm_out, gm_in, transpose=self.transpose)
+        r = F.target_vec()
+        z = scipy.sparse.linalg.lsqr(F, r)[0]
+        z_est_in, z_est_out = F.split(z)
+
+        if (with_onsager):
+            if (dir == "fwd"):
+                onsager = torch.mean(gm_out * (out_res - z_est_out))
+                return z_est_out, onsager
+            elif (dir == "bck"):
+                onsager = torch.mean(gm_in * (in_res - z_est_in))
+                return z_est_in, onsager
+        else:
+            if (dir == "fwd"):
+                return z_est_out
+            elif (dir == "bck"):
+                return z_est_in
+            
+class LinearLSQROp(scipy.sparse.linalg.LinearOperator):
+    def __init__(self, weight, bias, out_res, in_res, gm_out, gm_in):
+        def colvec(x):
+            return x.reshape([-1, 1])
+
+        self.weight = weight
+        self.bias = colvec(bias)
+        self.in_res = colvec(in_res)
+        self.out_res = colvec(out_res)
+        self.in_dim = len(in_res)
+        self.out_dim = len(out_res)
+        self.sgm_in = np.sqrt(gm_in)
+        self.sgm_out = np.sqrt(gm_out)
+        '''
+        Designed to solve the prox least squares problem v{l-1}/2 | z{l-1} - r{l-1} |^2 + vl/2 |zl - rl|^2 
+        given r{l-1}, rl, v{l-1}, vl. This is equivalent minimizing the norm of the vector difference 
         
+        | v'{l-1}I  0   | | z{l-1} | - | v'{l-1} r{l-1} |
+        | 0        v'lA | | z{l-1} |   | v'l rl         |
+        
+        in which v' = sqrt(v)
+        '''
+
+    def split(self, y):
+        first = y[:self.in_dim]
+        second = y[self.in_dim:]
+        return first, second
+
+    def target_vec(self):
+        return np.concatenate([self.sgm_in * self.in_res, self.sgm_out * (self.out_res - self.bias)], axis=0)
+
+    def _matvec(self, in_z):
+        return np.concatenate([self.sgm_in * in_z, self.sgm_out * self.weight @ in_z], axis=0)
+
+    def _rmatvec(self, y):
+        y = y.reshape([-1, 1])
+        in_res, out_res = self.split(y)
+        assert len(out_res) == self.out_dim, "dimensionality mismatch in LSQR input vector."
+        return np.concatenate([self.sgm_in * in_res, self.sgm_out * self.weight.T @ out_res], axis=0)
+
+class BilinearUpsLSQROp(scipy.sparse.linalg.LinearOperator):
+    ...
+
+class ConvLSQROp(scipy.sparse.linalg.LinearOperator):
+    def __init__(self, conv, out_res, in_res, gm_out, gm_in, transpose=False):
+        # inputs in_res and out_res are assumed to be C x H x W images.
+        # they will be concatenated on the channel dimension.
+        # todo: watch for errors related to the fact that input and output vectors are not vector shaped.
+        def colvec(x):
+            return x.reshape([-1, 1])
+
+        self.bias = conv.bias
+        if(transpose):
+            self.conv = torch.nn.ConvTranspose2d(in_channels=conv.in_channels,
+                                        out_channels=conv.out_channels,
+                                        kernel_size=conv.kernel_size,
+                                        padding=conv.padding,
+                                        bias=False).to('cpu')
+            self.transpose_conv = torch.nn.Conv2d(in_channels=conv.out_channels,
+                                                           out_channels=conv.in_channels,
+                                                           kernel_size=conv.kernel_size,
+                                                           padding=conv.padding,
+                                                           bias=False).to('cpu')
+            self.conv.weight.data = conv.weight
+            self.transpose_conv.weight.data = conv.weight
+        else:
+            self.conv = torch.nn.Conv2d(in_channels=conv.in_channels,
+                                        out_channels=conv.out_channels,
+                                        kernel_size=conv.kernel_size,
+                                        padding=conv.padding,
+                                        bias=False).to('cpu')
+            self.transpose_conv = torch.nn.ConvTranspose2d(in_channels=conv.out_channels,
+                                                           out_channels=conv.in_channels,
+                                                           kernel_size=conv.kernel_size,
+                                                           padding=conv.padding,
+                                                           bias=False).to('cpu')
+            self.conv.weight.data = conv.weight
+            self.transpose_conv.weight.data = conv.weight
+        self.in_res = colvec(in_res)
+        self.out_res = colvec(out_res)
+        self.in_dim = len(in_res)
+        self.out_dim = len(out_res)
+        self.sgm_in = np.sqrt(gm_in)
+        self.sgm_out = np.sqrt(gm_out)
+
+    def split(self, y):
+        first = y[:self.in_dim]
+        second = y[self.in_dim:]
+        return first, second
+
+    def target_vec(self):
+        return np.concatenate([self.sgm_in * self.in_res, self.sgm_out * (self.out_res - self.bias)], axis=0)
+
+    def _matvec(self, in_z):
+        def tensorize(z):
+            return torch.FloatTensor(z[None, ...]).to('cpu')
+        conv_at_in_z = self.conv.forward(tensorize(in_z))[0].detach().cpu().numpy()
+        return np.concatenate([self.sgm_in * in_z, self.sgm_out * conv_at_in_z], axis=0)
+
+    def _rmatvec(self, y):
+        in_res, out_res = self.split(y)
+        assert len(out_res) == self.out_dim, "dimension mismatch on channel dimension in the linear convolution operator"
+        def tensorize(z):
+            return torch.FloatTensor(z[None, ...]).to('cpu')
+        t_conv_at_out_res = self.transpose_conv.forward(tensorize(out_res)).detach().cpu().numpy()
+        return np.concatenate([self.sgm_in * in_res, self.sgm_out * t_conv_at_out_res], axis=0)
