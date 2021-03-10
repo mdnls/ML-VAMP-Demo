@@ -276,7 +276,7 @@ class ConvLayerEstimator(LayerEstimator):
                 return z_est_out
             elif (dir == "bck"):
                 return z_est_in
-            
+
 class LinearLSQROp(scipy.sparse.linalg.LinearOperator):
     def __init__(self, weight, bias, out_res, in_res, gm_out, gm_in):
         def colvec(x):
@@ -318,7 +318,60 @@ class LinearLSQROp(scipy.sparse.linalg.LinearOperator):
         return np.concatenate([self.sgm_in * in_res, self.sgm_out * self.weight.T @ out_res], axis=0)
 
 class BilinearUpsLSQROp(scipy.sparse.linalg.LinearOperator):
-    ...
+    def __init__(self, in_HW, out_HW, out_res, in_res, gm_out, gm_in):
+        def colvec(x):
+            return x.reshape([-1, 1])
+
+        self.layer = torch.nn.Upsample(size=out_HW, mode='bilinear', align_corners=True)
+        # bilinear upsampling implements a sparse structured matrix multiplication
+        # here we compute the transpose by computing columns by applying the matrix to a basis
+        basis = torch.eye(in_HW[0] * in_HW[1]).reshape((1, -1, in_HW[0], in_HW[1])).to('cpu')
+        img_of_basis = self.layer(basis).detach().cpu().numpy().reshape((in_HW[0] * in_HW[1], out_HW[0] * out_HW[1]))
+        upsT_operator = torch.sparse_coo_tensor( np.argwhere(img_of_basis != 0).T, img_of_basis[img_of_basis != 0], img_of_basis.shape).to('cpu')
+
+        in_C = len(in_res)
+        out_C = len(out_res)
+        self.upsT_operator = upsT_operator
+        self.img_of_basis = img_of_basis.T
+        self.img_of_basis = self.layer(basis)
+        self.in_res = colvec(in_res)
+        self.out_res = colvec(out_res)
+        self.in_dim = (in_C, in_HW[0], in_HW[1])
+        self.out_dim = (out_C, out_HW[0], out_HW[1])
+        self.in_HW = in_HW
+        self.out_HW = out_HW
+        self.sgm_in = np.sqrt(gm_in)
+        self.sgm_out = np.sqrt(gm_out)
+
+    def stack(self, in_im, out_im):
+        return np.concatenate([in_im.flatten(), out_im.flatten()], axis=0)
+
+    def split(self, y):
+        in_cpts = np.prod(self.in_dim)
+        first = y[:in_cpts]
+        second = y[in_cpts:]
+        return first, second
+
+    def target_vec(self):
+        return np.concatenate([self.sgm_in * self.in_res, self.sgm_out * (self.out_res - self.bias)], axis=0)
+
+    def _matvec(self, in_z):
+        # given an image in flattened vector format of size in_dim
+        def tensorize(z):
+            return torch.FloatTensor(z.reshape(self.in_dim)[None, ...]).to('cpu')
+        ups_in_z = self.layer.forward(tensorize(in_z))[0].detach().cpu().numpy()
+        return self.stack(self.sgm_in * in_z, self.sgm_out * ups_in_z)
+
+    def _rmatvec(self, y):
+        # y is the stack of two input and output images in vector format.
+        in_res, out_res = self.split(y)
+        assert len(out_res) == np.prod(self.out_dim), "dimension mismatch on channel dimension in the linear convolution operator"
+
+        out_res = torch.FloatTensor(out_res.reshape((self.out_dim[0], -1))).to('cpu')
+
+        t_ups_out_res = torch.sparse.mm(self.upsT_operator, out_res.T).T
+
+        return self.stack(self.sgm_in * in_res, self.sgm_out * t_ups_out_res)
 
 class ConvLSQROp(scipy.sparse.linalg.LinearOperator):
     def __init__(self, conv, out_res, in_res, gm_out, gm_in, transpose=False):
@@ -381,5 +434,37 @@ class ConvLSQROp(scipy.sparse.linalg.LinearOperator):
         assert len(out_res) == self.out_dim, "dimension mismatch on channel dimension in the linear convolution operator"
         def tensorize(z):
             return torch.FloatTensor(z[None, ...]).to('cpu')
-        t_conv_at_out_res = self.transpose_conv.forward(tensorize(out_res)).detach().cpu().numpy()
+        t_conv_at_out_res = self.transpose_conv.forward(tensorize(out_res))[0].detach().cpu().numpy()
         return np.concatenate([self.sgm_in * in_res, self.sgm_out * t_conv_at_out_res], axis=0)
+
+
+if __name__ == "__main__":
+    out_res = np.zeros((3, 10, 10))
+    in_res = np.zeros((6, 10, 10))
+    out_res_2 = np.zeros((6, 20, 20))
+
+    out_res[0, 0, 0] = 1
+    out_res_2[1, 1, 1] = 1
+    in_res[1, 1, 1] = 1
+
+
+    conv_layer = torch.nn.Conv2d(in_channels=6, out_channels=3, kernel_size=(3, 3), padding=(1, 1))
+    conv = ConvLSQROp(conv_layer, out_res, in_res, 1, 1)
+    ups = BilinearUpsLSQROp((10, 10), (20, 20), out_res_2, in_res, 1, 1)
+
+    join = np.concatenate([in_res, out_res], axis=0)
+    _, conv_trns_out_res = conv.split(conv._rmatvec(join))
+    _, conv_in_res = conv.split(conv._matvec(in_res))
+
+
+    _, trns_out_res = ups.split(ups._rmatvec(ups.stack(in_res, out_res_2)))
+    _, ups_in_res = ups.split(ups._matvec(in_res.flatten()))
+
+
+    print("Conv2D")
+    print(np.dot(in_res.flatten(), conv_trns_out_res.flatten()))
+    print(np.dot(conv_in_res.flatten(), out_res.flatten()))
+    print("Upsample")
+    print(np.dot(in_res.flatten(), trns_out_res.flatten()))
+    print(np.dot(ups_in_res.flatten(), out_res_2.flatten()))
+
